@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Love Portal — Multiplayer</title>
+
+  <!-- Three.js and Socket.io client -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; }
+    #ui { position: absolute; top: 10px; left: 10px; color: #fff; z-index: 20; }
+    input, button { margin: 4px; padding: 6px 8px; }
+    #overlay { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); color:white; z-index:30; display:none; background:rgba(0,0,0,0.6); padding:20px; border-radius:8px; }
+    #shareLink { margin-top:8px; color: #0ff; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <input id="name" placeholder="Your name" />
+    <input id="char" placeholder="Char (e.g., ❤️)" maxlength="2" style="width:70px" />
+    <button id="joinBtn">Join</button>
+    <div id="shareLink"></div>
+    <div style="margin-top:6px;color:#ddd;font-size:13px;">Controls: WASD to move • 1=wave • 2=dance • 3=blow</div>
+  </div>
+
+  <div id="overlay"></div>
+
+<script>
+/* ---------- Networking ---------- */
+const socket = io(); // connects to same origin
+let myId = null;
+let roomId = window.location.pathname.split('/').pop() || 'default';
+if (!roomId || roomId === '') roomId = 'default';
+
+const players = {}; // other players' data { id: { mesh, name, char } }
+
+/* ---------- Three.js Basic Scene ---------- */
+let scene, camera, renderer, clock;
+let localPlayer = { mesh: null, name: '', char: '', pos:{x:0,y:0,z:0}, rotY:0 };
+const otherGroup = new THREE.Group();
+initThree();
+
+function initThree(){
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x6ec1ff);
+
+  camera = new THREE.PerspectiveCamera(65, innerWidth/innerHeight, 0.1, 1000);
+  camera.position.set(0, 3, 7);
+
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+  hemi.position.set(0, 50, 0);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+  dir.position.set(-3,10,5);
+  scene.add(dir);
+
+  // ground
+  const ground = new THREE.Mesh(
+    new THREE.PlaneGeometry(80,80),
+    new THREE.MeshLambertMaterial({ color: 0x88c97a })
+  );
+  ground.rotation.x = -Math.PI/2;
+  ground.position.y = 0;
+  scene.add(ground);
+
+  // portal (ring)
+  const portalGeo = new THREE.RingGeometry(1.2, 1.5, 32);
+  const portalMat = new THREE.MeshBasicMaterial({ color: 0x8a2be2, side: THREE.DoubleSide });
+  const portal = new THREE.Mesh(portalGeo, portalMat);
+  portal.position.set(0, 1.2, -6);
+  portal.rotation.x = Math.PI/2;
+  portal.name = 'portal';
+  scene.add(portal);
+
+  // cake**
+  const cake = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.2,1.2,0.8,32),
+    new THREE.MeshLambertMaterial({ color: 0xffc0cb })
+  );
+  cake.position.set(-5, 0.4, 0);
+  scene.add(cake);
+
+  scene.add(otherGroup);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  clock = new THREE.Clock();
+  window.addEventListener('resize', onResize);
+}
+
+/* ---------- Local player creation ---------- */
+function createLocalPlayer(name, char) {
+  localPlayer.name = name || 'Player';
+  localPlayer.char = char || '❤';
+  // simple body: sphere + little "flag" plane for char
+  const body = new THREE.Mesh(
+    new THREE.SphereGeometry(0.45, 16, 16),
+    new THREE.MeshLambertMaterial({ color: 0xff5555 })
+  );
+  const flagGeo = new THREE.PlaneGeometry(0.6,0.4);
+  const canvas = document.createElement('canvas');
+  canvas.width = 128; canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = "#00000000";
+  ctx.fillRect(0,0,128,64);
+  ctx.fillStyle = "white";
+  ctx.font = "40px serif";
+  ctx.textAlign = "center";
+  ctx.fillText(localPlayer.char, 64, 48);
+  const tex = new THREE.CanvasTexture(canvas);
+  const flagMat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+  const flag = new THREE.Mesh(flagGeo, flagMat);
+  flag.position.set(0, 0.7, 0.5);
+  flag.rotation.x = -0.2;
+
+  const group = new THREE.Group();
+  group.add(body);
+  group.add(flag);
+  group.position.set(0, 0.5, 0);
+
+  scene.add(group);
+  localPlayer.mesh = group;
+}
+
+/* ---------- Other player helper ---------- */
+function spawnOtherPlayer(p) {
+  if (players[p.id]) return;
+  const color = 0x3377ff;
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.42, 12, 12), new THREE.MeshLambertMaterial({color}));
+  const canvas = document.createElement('canvas'); canvas.width=128; canvas.height=64;
+  const ctx = canvas.getContext('2d'); ctx.fillStyle="white"; ctx.font="40px serif"; ctx.textAlign='center'; ctx.fillText(p.char||'❤',64,48);
+  const tex = new THREE.CanvasTexture(canvas);
+  const flag = new THREE.Mesh(new THREE.PlaneGeometry(0.6,0.4), new THREE.MeshBasicMaterial({map:tex,transparent:true}));
+  flag.position.set(0,0.7,0.5); flag.rotation.x=-0.2;
+  const g = new THREE.Group(); g.add(mesh); g.add(flag); g.position.set(p.pos.x, p.pos.y+0.5, p.pos.z);
+  otherGroup.add(g);
+  players[p.id] = { info: p, meshGroup: g };
+}
+
+/* ---------- Input & movement ---------- */
+const keys = { w:false, a:false, s:false, d:false };
+window.addEventListener('keydown', e => {
+  if (e.key === 'w') keys.w = true;
+  if (e.key === 'a') keys.a = true;
+  if (e.key === 's') keys.s = true;
+  if (e.key === 'd') keys.d = true;
+
+  if (e.key === '1') sendAction('wave');
+  if (e.key === '2') sendAction('dance');
+  if (e.key === '3') sendAction('blow');
+});
+window.addEventListener('keyup', e => {
+  if (e.key === 'w') keys.w = false;
+  if (e.key === 'a') keys.a = false;
+  if (e.key === 's') keys.s = false;
+  if (e.key === 'd') keys.d = false;
+});
+
+/* Movement params */
+const SPEED = 3.0; // units / second
+
+/* ---------- Networking emits (throttled) ---------- */
+let lastEmit = 0;
+function sendPosition() {
+  if (!myId || !localPlayer.mesh) return;
+  const pos = localPlayer.mesh.position;
+  const rotY = localPlayer.rotY || 0;
+  socket.emit('move', { room: roomId, pos: { x: pos.x, y: pos.y, z: pos.z }, rotY });
+}
+
+/* send actions */
+function sendAction(action) {
+  if (!myId) return;
+  // locally apply a quick effect
+  applyLocalAction(action);
+  socket.emit('action', { room: roomId, action });
+}
+
+/* ---------- Apply actions (local) ---------- */
+function applyLocalAction(action) {
+  if (!localPlayer.mesh) return;
+  if (action === 'wave') {
+    // scale pulse
+    const g = localPlayer.mesh;
+    const orig = g.scale.clone();
+    let t0 = performance.now();
+    const dur = 500;
+    const anim = (t) => {
+      const p = Math.min(1, (t - t0)/dur);
+      const s = 1.0 + Math.sin(p*Math.PI*2)*0.12;
+      g.scale.setScalar(s);
+      if (p < 1) requestAnimationFrame(anim);
+      else g.scale.copy(orig);
+    };
+    requestAnimationFrame(anim);
+  } else if (action === 'dance') {
+    // rotate 360 a bit
+    const g = localPlayer.mesh;
+    let t0 = performance.now();
+    const dur = 700;
+    const anim = (t) => {
+      const p = Math.min(1, (t - t0)/dur);
+      g.rotation.y = p * Math.PI * 2;
+      if (p < 1) requestAnimationFrame(anim);
+      else g.rotation.y = 0;
+    };
+    requestAnimationFrame(anim);
+  } else if (action === 'blow') {
+    // play small twinkle and scale down tiny
+    const g = localPlayer.mesh;
+    const orig = g.scale.clone();
+    let t0 = performance.now();
+    const dur = 500;
+    const anim = (t) => {
+      const p = Math.min(1, (t - t0)/dur);
+      const s = 1.0 - Math.sin(p*Math.PI)*0.05;
+      g.scale.setScalar(s);
+      if (p < 1) requestAnimationFrame(anim);
+      else g.scale.copy(orig);
+    };
+    requestAnimationFrame(anim);
+  }
+}
+
+/* ---------- Socket listeners (server messages) ---------- */
+socket.on('connect', () => {
+  console.log('connected to server', socket.id);
+});
+
+socket.on('joined', ({ id, room }) => {
+  myId = id;
+  roomId = room;
+  // show share link
+  const url = `${location.origin}/${roomId}`;
+  document.getElementById('shareLink').innerText = `Share this room: ${url}`;
+});
+
+socket.on('currentPlayers', (list) => {
+  list.forEach(p => {
+    spawnOtherPlayer(p);
+  });
+});
+
+socket.on('playerJoined', (p) => {
+  spawnOtherPlayer(p);
+});
+
+socket.on('playerMoved', ({ id, pos, rotY }) => {
+  const entry = players[id];
+  if (!entry) return;
+  // smooth set
+  entry.meshGroup.position.lerp(new THREE.Vector3(pos.x, pos.y+0.5, pos.z), 0.6);
+  entry.info.pos = pos;
+});
+
+socket.on('playerAction', ({ id, action }) => {
+  const entry = players[id];
+  if (!entry) return;
+  // simple action: scale pulse or rotate
+  const g = entry.meshGroup;
+  if (action === 'wave') {
+    const orig = g.scale.clone();
+    let t0 = performance.now(); const dur = 500;
+    const anim = (t) => {
+      const p = Math.min(1,(t-t0)/dur);
+      const s = 1.0 + Math.sin(p*Math.PI*2)*0.12;
+      g.scale.setScalar(s);
+      if (p<1) requestAnimationFrame(anim);
+      else g.scale.copy(orig);
+    }; requestAnimationFrame(anim);
+  } else if (action === 'dance') {
+    let t0 = performance.now(); const dur = 700;
+    const anim = (t) => {
+      const p = Math.min(1,(t-t0)/dur);
+      g.rotation.y = p*Math.PI*2;
+      if (p<1) requestAnimationFrame(anim); else g.rotation.y = 0;
+    }; requestAnimationFrame(anim);
+  } else if (action === 'blow') {
+    const orig = g.scale.clone();
+    let t0 = performance.now(); const dur = 500;
+    const anim = (t) => {
+      const p = Math.min(1,(t-t0)/dur);
+      const s = 1.0 - Math.sin(p*Math.PI)*0.05;
+      g.scale.setScalar(s);
+      if (p<1) requestAnimationFrame(anim); else g.scale.copy(orig);
+    }; requestAnimationFrame(anim);
+  }
+});
+
+socket.on('playerLeft', ({ id }) => {
+  if (players[id]) {
+    otherGroup.remove(players[id].meshGroup);
+    delete players[id];
+  }
+});
+
+socket.on('portalSolved', ({ by }) => {
+  // simple overlay celebration
+  const o = document.getElementById('overlay');
+  o.innerHTML = `<h2>Portal Opened! 🎵</h2><div>${by ? by : 'Someone'} solved the portal</div>`;
+  o.style.display = 'block';
+  setTimeout(()=>o.style.display='none', 5000);
+});
+
+/* ---------- Game loop ---------- */
+let lastTime = performance.now();
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = (now - lastTime) / 1000;
+  lastTime = now;
+
+  // local movement
+  if (localPlayer.mesh) {
+    const dir = new THREE.Vector3();
+    if (keys.w) dir.z -= 1;
+    if (keys.s) dir.z += 1;
+    if (keys.a) dir.x -= 1;
+    if (keys.d) dir.x += 1;
+    if (dir.lengthSq() > 0) {
+      dir.normalize();
+      const move = dir.multiplyScalar(SPEED * dt);
+      localPlayer.mesh.position.add(move);
+      // update rotY to face movement
+      localPlayer.rotY = Math.atan2(move.x, move.z);
+      localPlayer.mesh.rotation.y = localPlayer.rotY;
+      // throttle position emit
+      if (performance.now() - lastEmit > 80) {
+        sendPosition();
+        lastEmit = performance.now();
+      }
+    }
+    // camera follow
+    const camTarget = new THREE.Vector3(localPlayer.mesh.position.x, localPlayer.mesh.position.y + 1.5, localPlayer.mesh.position.z + 4);
+    camera.position.lerp(camTarget, 0.08);
+    camera.lookAt(localPlayer.mesh.position);
+  }
+
+  // simple portal proximity check (client-side)
+  if (localPlayer.mesh) {
+    const portal = scene.getObjectByName('portal');
+    if (portal) {
+      const dist = localPlayer.mesh.position.distanceTo(new THREE.Vector3(portal.position.x, portal.position.y, portal.position.z));
+      if (dist < 1.6) {
+        // solved - notify server (once)
+        if (!localPlayer.portalSolved) {
+          localPlayer.portalSolved = true;
+          socket.emit('portalSolved', { room: roomId, by: localPlayer.name });
+        }
+      }
+    }
+  }
+
+  renderer.render(scene, camera);
+}
+animate();
+
+/* ---------- UI: Join button ---------- */
+document.getElementById('joinBtn').addEventListener('click', () => {
+  const name = document.getElementById('name').value || `Player${Math.floor(Math.random()*999)}`;
+  const char = document.getElementById('char').value || '❤';
+  if (!localPlayer.mesh) createLocalPlayer(name, char);
+  // emit join
+  socket.emit('join', { name, char, room: roomId });
+  // show share link
+  document.getElementById('shareLink').innerText = `Share this room: ${location.origin}/${roomId}`;
+});
+</script>
+</body>
+</html>
